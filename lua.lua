@@ -454,24 +454,104 @@ CommandHandlers["fling"] = function(args)
     if not myChar then return false, "you have no character" end
     local myRoot = myChar:FindFirstChild("HumanoidRootPart")
     if not myRoot then return false, "no root part" end
+    local myHum = myChar:FindFirstChildOfClass("Humanoid")
+    if not myHum then return false, "no humanoid" end
 
     local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
     if not targetRoot then return false, "target has no root part" end
 
     log("FLING player: " .. player.Name)
 
-    -- Simple fling: tp to target with high velocity
-    local origPos = myRoot.CFrame
-    myRoot.CFrame = targetRoot.CFrame
-    local bv = Instance.new("BodyVelocity")
-    bv.MaxForce = Vector3.new(1e6, 1e6, 1e6)
-    bv.Velocity = Vector3.new(0, 300, 0)
-    bv.Parent = myRoot
+    -- Create anchor part + AlignPosition (from danya23131's fling)
+    local fakepart = Instance.new("Part", workspace)
+    fakepart.Anchored = true
+    fakepart.Size = Vector3.new(1, 1, 1)
+    fakepart.CanCollide = false
+    fakepart.Transparency = 1
+    fakepart.Position = myRoot.Position
 
-    task.wait(0.3)
-    bv:Destroy()
+    local att1 = Instance.new("Attachment", fakepart)
+    local att2 = Instance.new("Attachment", myRoot)
+    local body = Instance.new("AlignPosition", fakepart)
+    body.Attachment0 = att2
+    body.Attachment1 = att1
+    body.RigidityEnabled = true
+    body.Responsiveness = math.huge
+    body.MaxForce = math.huge
+    body.MaxVelocity = math.huge
+    body.MaxAxesForce = Vector3.new(math.huge, math.huge, math.huge)
+    body.Mode = Enum.PositionAlignmentMode.TwoAttachment
+
+    -- Enter fling state
+    myHum:ChangeState(Enum.HumanoidStateType.StrafingNoPhysics)
+    myHum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+
+    -- Launch up to build momentum
+    local oldcf = myRoot.CFrame
+    myRoot.CFrame = CFrame.new(Vector3.new(0, 40000000, 0)) * CFrame.fromEulerAnglesXYZ(math.rad(180), 0, 0)
+    myRoot.Velocity = Vector3.new(0, 1000000, 0)
+    task.wait(3)
+    myRoot.Velocity = Vector3.new(0, 0, 0)
+    myRoot.CFrame = oldcf
     task.wait(0.2)
-    myRoot.CFrame = origPos
+
+    -- Move to target and spin with high velocity
+    local duration = 6
+    local startTime = tick()
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if tick() - startTime > duration then
+            conn:Disconnect()
+            return
+        end
+
+        -- Refresh target position
+        local tRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if not tRoot then
+            conn:Disconnect()
+            return
+        end
+
+        -- Move fakepart to target
+        fakepart.Position = tRoot.Position
+
+        -- Face target
+        pcall(function()
+            local lookAt = CFrame.lookAt(
+                myRoot.Position,
+                Vector3.new(tRoot.Position.X, myRoot.Position.Y, tRoot.Position.Z)
+            )
+            myRoot.CFrame = lookAt
+        end)
+
+        -- Apply fling velocity + angular spin
+        myRoot.AssemblyAngularVelocity = Vector3.new(
+            math.random(-500, 50),
+            math.random(-500, 500) * 100,
+            math.random(-5, 5)
+        )
+        myRoot.Velocity = Vector3.new(
+            math.random(-250, 250),
+            math.random(-500, 500),
+            math.random(-250, 250)
+        )
+
+        myRoot.CFrame = fakepart.CFrame
+        myHum:ChangeState(Enum.HumanoidStateType.Swimming)
+    end)
+
+    -- Wait for fling duration then clean up
+    task.delay(duration + 0.5, function()
+        pcall(function() conn:Disconnect() end)
+        pcall(function() att1:Destroy() end)
+        pcall(function() att2:Destroy() end)
+        pcall(function() body:Destroy() end)
+        pcall(function() fakepart:Destroy() end)
+        pcall(function()
+            myHum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+            myHum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end)
+    end)
 end
 
 -- ── Info ──
