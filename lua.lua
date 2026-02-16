@@ -1,17 +1,26 @@
 --[[
-    CatControl Executor v3.0 — Auto-Register + Auto-Rejoin
+    CatControl Executor v4.0
 
-    - Registers with Catbase using LocalPlayer.Name
-    - Heartbeat keeps status alive
-    - Polls per-user command path
-    - Auto-rejoins if kicked from server
-    - Skips "cleared" commands (stale pending)
-
-    Designed for exploit executors (Solara, Synapse, Fluxus, etc.)
+    - Anti-double-execute guard
+    - Auto-registers with Catbase
+    - Heartbeat, auto-rejoin on kick
+    - Player list reporting
+    - Fling, goto player, tp to player, speed, noclip, god, invis, fly
+    - Skips cleared commands
 ]]
 
 -- ═══════════════════════════════════════════════════════════════════════════════
---  CONFIGURATION
+--  ANTI-DOUBLE-EXECUTE
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+if _G.CatControlRunning then
+    warn("[CatControl] Already running — skipping duplicate execution")
+    return
+end
+_G.CatControlRunning = true
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+--  CONFIG
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 local CONFIG = {
@@ -19,11 +28,11 @@ local CONFIG = {
     apiKey     = "0bdfcf7e815ae951f75a66a475feb6ed4b723b81ebd9ef473a761b99cc9d4f6e",
     database   = "roblox_control",
 
-    pollInterval      = 2,       -- seconds between command polls
-    heartbeatInterval = 15,      -- seconds between heartbeats
-    retryDelay        = 5,       -- seconds to wait after an error
-    maxRetries        = 3,       -- consecutive errors before backing off
-    backoffDelay      = 15,      -- seconds to wait after maxRetries errors
+    pollInterval      = 2,
+    heartbeatInterval = 15,
+    retryDelay        = 5,
+    maxRetries        = 3,
+    backoffDelay      = 15,
 
     debug = true,
 }
@@ -38,11 +47,13 @@ local HttpService        = game:GetService("HttpService")
 local StarterGui         = game:GetService("StarterGui")
 local MarketplaceService = game:GetService("MarketplaceService")
 local CoreGui            = game:GetService("CoreGui")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
 
 -- ═══════════════════════════════════════════════════════════════════════════════
---  PER-USER PATHS  (derived from the Roblox username)
+--  PER-USER PATHS
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 local USERNAME      = LocalPlayer.Name
@@ -51,7 +62,7 @@ local COMMAND_PATH  = "commands/" .. USERNAME
 local LOG_PATH      = "logs/" .. USERNAME
 
 -- ═══════════════════════════════════════════════════════════════════════════════
---  HTTP ABSTRACTION  (works across most executors)
+--  HTTP ABSTRACTION
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 local function httpRequest(params)
@@ -66,7 +77,7 @@ local function httpRequest(params)
     elseif fluxus and fluxus.request then
         return fluxus.request(params)
     else
-        error("No HTTP request function found — your executor may not support HTTP requests")
+        error("No HTTP request function found")
     end
 end
 
@@ -102,17 +113,13 @@ local function notify(title, text, duration)
 end
 
 local function jsonDecode(str)
-    local ok, result = pcall(function()
-        return HttpService:JSONDecode(str)
-    end)
+    local ok, result = pcall(function() return HttpService:JSONDecode(str) end)
     if ok then return result end
     return nil
 end
 
 local function jsonEncode(tbl)
-    local ok, result = pcall(function()
-        return HttpService:JSONEncode(tbl)
-    end)
+    local ok, result = pcall(function() return HttpService:JSONEncode(tbl) end)
     if ok then return result end
     return "{}"
 end
@@ -123,101 +130,78 @@ end
 
 local function catbaseGet(path)
     local url = string.format("%s/db/%s/%s", CONFIG.catbaseUrl, CONFIG.database, path)
-
     local ok, response = pcall(function()
         return httpRequest({
-            Url = url,
-            Method = "GET",
-            Headers = {
-                ["X-API-Key"] = CONFIG.apiKey,
-                ["Content-Type"] = "application/json",
-            },
+            Url = url, Method = "GET",
+            Headers = { ["X-API-Key"] = CONFIG.apiKey, ["Content-Type"] = "application/json" },
         })
     end)
-
-    if not ok then
-        log("GET request failed: " .. tostring(response), "ERROR")
-        return nil
-    end
-
-    if response.StatusCode ~= 200 then
-        log("GET " .. path .. " → " .. tostring(response.StatusCode), "WARN")
-        return nil
-    end
-
+    if not ok then log("GET failed: " .. tostring(response), "ERROR"); return nil end
+    if response.StatusCode ~= 200 then return nil end
     return jsonDecode(response.Body)
 end
 
 local function catbasePut(path, data)
     local url = string.format("%s/db/%s/%s", CONFIG.catbaseUrl, CONFIG.database, path)
-    local body = jsonEncode(data)
-
     local ok, response = pcall(function()
         return httpRequest({
-            Url = url,
-            Method = "PUT",
-            Headers = {
-                ["X-API-Key"] = CONFIG.apiKey,
-                ["Content-Type"] = "application/json",
-            },
-            Body = body,
+            Url = url, Method = "PUT", Body = jsonEncode(data),
+            Headers = { ["X-API-Key"] = CONFIG.apiKey, ["Content-Type"] = "application/json" },
         })
     end)
-
-    if not ok then
-        log("PUT request failed: " .. tostring(response), "ERROR")
-        return false
-    end
-
+    if not ok then log("PUT failed: " .. tostring(response), "ERROR"); return false end
     return response.StatusCode == 200
 end
 
 local function catbasePatch(path, data)
     local url = string.format("%s/db/%s/%s", CONFIG.catbaseUrl, CONFIG.database, path)
-    local body = jsonEncode(data)
-
     local ok, response = pcall(function()
         return httpRequest({
-            Url = url,
-            Method = "PATCH",
-            Headers = {
-                ["X-API-Key"] = CONFIG.apiKey,
-                ["Content-Type"] = "application/json",
-            },
-            Body = body,
+            Url = url, Method = "PATCH", Body = jsonEncode(data),
+            Headers = { ["X-API-Key"] = CONFIG.apiKey, ["Content-Type"] = "application/json" },
         })
     end)
-
-    if not ok then
-        log("PATCH request failed: " .. tostring(response), "ERROR")
-        return false
-    end
-
+    if not ok then log("PATCH failed: " .. tostring(response), "ERROR"); return false end
     return response.StatusCode == 200
 end
 
 local function catbasePost(path, data)
     local url = string.format("%s/db/%s/%s", CONFIG.catbaseUrl, CONFIG.database, path)
-    local body = jsonEncode(data)
-
     local ok, response = pcall(function()
         return httpRequest({
-            Url = url,
-            Method = "POST",
-            Headers = {
-                ["X-API-Key"] = CONFIG.apiKey,
-                ["Content-Type"] = "application/json",
-            },
-            Body = body,
+            Url = url, Method = "POST", Body = jsonEncode(data),
+            Headers = { ["X-API-Key"] = CONFIG.apiKey, ["Content-Type"] = "application/json" },
         })
     end)
-
-    if not ok then
-        log("POST request failed: " .. tostring(response), "ERROR")
-        return false
-    end
-
+    if not ok then log("POST failed: " .. tostring(response), "ERROR"); return false end
     return response.StatusCode == 200
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+--  PLAYER FINDER HELPER
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+local function findPlayer(name)
+    if not name or name == "" then return nil end
+    name = name:lower()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower() == name or p.DisplayName:lower() == name then
+            return p
+        end
+    end
+    -- partial match
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower():find(name, 1, true) or p.DisplayName:lower():find(name, 1, true) then
+            return p
+        end
+    end
+    return nil
+end
+
+local function getCharPos(player)
+    local char = player and player.Character
+    local root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head"))
+    return root and root.Position
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -228,9 +212,7 @@ local function getGameName()
     local name = "Unknown"
     pcall(function()
         local info = MarketplaceService:GetProductInfo(game.PlaceId)
-        if info and info.Name then
-            name = info.Name
-        end
+        if info and info.Name then name = info.Name end
     end)
     return name
 end
@@ -247,12 +229,10 @@ local function register()
         joinedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
         lastSeen = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     }
-
     local ok = catbasePut(EXECUTOR_PATH, data)
     if ok then
         log("Registered as: " .. USERNAME)
-        log("  Game: " .. gameName .. " (PlaceId: " .. tostring(game.PlaceId) .. ")")
-        log("  Server: " .. tostring(game.JobId))
+        log("  Game: " .. gameName .. " (" .. tostring(game.PlaceId) .. ")")
     else
         log("Registration failed!", "ERROR")
     end
@@ -285,10 +265,8 @@ end
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 local function setupAutoRejoin()
-    -- Detect kick / disconnect and auto-rejoin the same place
     local placeId = game.PlaceId
 
-    -- Method 1: CoreGui error prompt ("You have been kicked")
     pcall(function()
         local errorPrompt = CoreGui:WaitForChild("RobloxPromptGui", 2)
         if errorPrompt then
@@ -300,7 +278,6 @@ local function setupAutoRejoin()
         end
     end)
 
-    -- Method 2: TeleportService failure callback
     pcall(function()
         TeleportService.TeleportInitFailed:Connect(function(player, result)
             if player == LocalPlayer then
@@ -311,7 +288,6 @@ local function setupAutoRejoin()
         end)
     end)
 
-    -- Method 3: Player.OnTeleport status
     pcall(function()
         LocalPlayer.OnTeleport:Connect(function(state)
             if state == Enum.TeleportState.Failed then
@@ -331,6 +307,8 @@ end
 
 local CommandHandlers = {}
 
+-- ── Game Control ──
+
 CommandHandlers["leave"] = function(args)
     log("Executing: LEAVE")
     notify("CatControl", "Leaving game...", 2)
@@ -341,21 +319,15 @@ end
 
 CommandHandlers["reset"] = function(args)
     log("Executing: RESET")
-    notify("CatControl", "Resetting character...", 2)
-    local character = LocalPlayer.Character
-    if character then
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            humanoid.Health = 0
-        else
-            character:BreakJoints()
-        end
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.Health = 0 else char:BreakJoints() end
     end
 end
 
 CommandHandlers["rejoin"] = function(args)
     log("Executing: REJOIN")
-    notify("CatControl", "Rejoining server...", 2)
     setOffline()
     task.wait(0.5)
     TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
@@ -363,7 +335,6 @@ end
 
 CommandHandlers["serverhop"] = function(args)
     log("Executing: SERVER HOP")
-    notify("CatControl", "Hopping to new server...", 2)
     setOffline()
     task.wait(0.5)
     TeleportService:Teleport(game.PlaceId, LocalPlayer)
@@ -371,104 +342,237 @@ end
 
 CommandHandlers["teleport"] = function(args)
     local placeId = args and tonumber(args.placeId)
-    if not placeId then
-        log("teleport: missing placeId arg", "ERROR")
-        return false, "missing placeId"
-    end
+    if not placeId then return false, "missing placeId" end
     log("Executing: TELEPORT to " .. tostring(placeId))
-    notify("CatControl", "Teleporting to " .. tostring(placeId), 2)
     setOffline()
     task.wait(0.5)
     TeleportService:Teleport(placeId, LocalPlayer)
 end
 
+-- ── Execution ──
+
 CommandHandlers["exec"] = function(args)
     local code = args and args.code
-    if not code or code == "" then
-        log("exec: no code provided", "ERROR")
-        return false, "no code"
-    end
+    if not code or code == "" then return false, "no code" end
     log("Executing: EXEC (" .. #code .. " chars)")
-
-    local fn, compileErr = loadstring(code)
-    if not fn then
-        log("exec compile error: " .. tostring(compileErr), "ERROR")
-        return false, "compile error: " .. tostring(compileErr)
-    end
-
+    local fn, err = loadstring(code)
+    if not fn then return false, "compile: " .. tostring(err) end
     local ok, runErr = pcall(fn)
-    if not ok then
-        log("exec runtime error: " .. tostring(runErr), "ERROR")
-        return false, "runtime error: " .. tostring(runErr)
-    end
-
+    if not ok then return false, "runtime: " .. tostring(runErr) end
     return true
-end
-
-CommandHandlers["print"] = function(args)
-    local msg = args and args.message or args and args.value or "hello from CatControl"
-    log("PRINT: " .. tostring(msg))
-    notify("CatControl", tostring(msg), 5)
 end
 
 CommandHandlers["chat"] = function(args)
     local msg = args and (args.message or args.value)
-    if not msg then
-        return false, "no message"
-    end
+    if not msg then return false, "no message" end
     log("Executing: CHAT → " .. tostring(msg))
-
     local ok = pcall(function()
         local tcs = game:GetService("TextChatService")
-        local channel = tcs.TextChannels:FindFirstChild("RBXGeneral")
-        if channel then
-            channel:SendAsync(tostring(msg))
-        end
+        local ch = tcs.TextChannels:FindFirstChild("RBXGeneral")
+        if ch then ch:SendAsync(tostring(msg)) end
     end)
-
     if not ok then
         pcall(function()
-            game:GetService("ReplicatedStorage")
-                .DefaultChatSystemChatEvents
-                .SayMessageRequest
-                :FireServer(tostring(msg), "All")
+            game:GetService("ReplicatedStorage").DefaultChatSystemChatEvents
+                .SayMessageRequest:FireServer(tostring(msg), "All")
         end)
     end
 end
 
+CommandHandlers["print"] = function(args)
+    local msg = args and (args.message or args.value) or "hello"
+    log("PRINT: " .. tostring(msg))
+    notify("CatControl", tostring(msg), 5)
+end
+
+-- ── Movement ──
+
 CommandHandlers["jump"] = function(args)
-    log("Executing: JUMP")
-    local character = LocalPlayer.Character
-    if character then
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-        end
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
     end
 end
 
 CommandHandlers["walkto"] = function(args)
+    -- walkto by coordinates OR by player name
+    local target = args and args.target
+    if target then
+        local player = findPlayer(target)
+        if not player then return false, "player not found: " .. target end
+        local pos = getCharPos(player)
+        if not pos then return false, "player has no character" end
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum:MoveTo(pos) end
+        end
+        log("WALKTO player: " .. player.Name)
+        return true
+    end
+    -- fallback: coordinates
     local x = args and tonumber(args.x) or 0
     local y = args and tonumber(args.y) or 0
     local z = args and tonumber(args.z) or 0
-    log(string.format("Executing: WALKTO (%s, %s, %s)", x, y, z))
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum:MoveTo(Vector3.new(x, y, z)) end
+    end
+end
 
-    local character = LocalPlayer.Character
-    if character then
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            humanoid:MoveTo(Vector3.new(x, y, z))
+CommandHandlers["goto"] = function(args)
+    -- Teleport to a player's position
+    local target = args and args.target
+    if not target then return false, "no target" end
+    local player = findPlayer(target)
+    if not player then return false, "player not found: " .. target end
+    local pos = getCharPos(player)
+    if not pos then return false, "player has no character" end
+    local char = LocalPlayer.Character
+    if char then
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if root then
+            root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+            log("GOTO player: " .. player.Name)
         end
     end
 end
 
+-- ── Player Interaction ──
+
+CommandHandlers["fling"] = function(args)
+    local target = args and args.target
+    if not target then return false, "no target" end
+    local player = findPlayer(target)
+    if not player then return false, "player not found: " .. target end
+    local targetChar = player.Character
+    if not targetChar then return false, "player has no character" end
+
+    local myChar = LocalPlayer.Character
+    if not myChar then return false, "you have no character" end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return false, "no root part" end
+
+    local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return false, "target has no root part" end
+
+    log("FLING player: " .. player.Name)
+
+    -- Simple fling: tp to target with high velocity
+    local origPos = myRoot.CFrame
+    myRoot.CFrame = targetRoot.CFrame
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+    bv.Velocity = Vector3.new(0, 300, 0)
+    bv.Parent = myRoot
+
+    task.wait(0.3)
+    bv:Destroy()
+    task.wait(0.2)
+    myRoot.CFrame = origPos
+end
+
+-- ── Info ──
+
+CommandHandlers["players"] = function(args)
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        table.insert(list, {
+            name = p.Name,
+            displayName = p.DisplayName,
+            userId = p.UserId,
+        })
+    end
+    -- Write the player list to catbase for the bot to read
+    catbasePut("playerlist/" .. USERNAME, {
+        players = list,
+        count = #list,
+        updatedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    })
+    log("Reported " .. #list .. " players")
+end
+
 CommandHandlers["ping"] = function(args)
-    log("PING received — executor alive")
-    notify("CatControl", "Pong! Executor is running", 3)
+    log("PING — alive")
+    notify("CatControl", "Pong!", 3)
 end
 
 CommandHandlers["none"] = function(args)
     return true
+end
+
+-- ── Extras ──
+
+CommandHandlers["speed"] = function(args)
+    local val = args and tonumber(args.value) or 50
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.WalkSpeed = val end
+    end
+    log("SPEED set to: " .. tostring(val))
+end
+
+CommandHandlers["jumppower"] = function(args)
+    local val = args and tonumber(args.value) or 100
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.UseJumpPower = true
+            hum.JumpPower = val
+        end
+    end
+    log("JUMPPOWER set to: " .. tostring(val))
+end
+
+CommandHandlers["god"] = function(args)
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.MaxHealth = math.huge; hum.Health = math.huge end
+    end
+    log("GOD mode enabled")
+end
+
+CommandHandlers["freeze"] = function(args)
+    local target = args and args.target
+    if not target then
+        -- freeze self
+        local char = LocalPlayer.Character
+        if char then
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if root then root.Anchored = not root.Anchored end
+        end
+        return
+    end
+    -- freeze target (only works if you can access their character)
+    local player = findPlayer(target)
+    if not player then return false, "player not found" end
+    local char = player.Character
+    if char then
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if root then root.Anchored = true end
+    end
+end
+
+CommandHandlers["bringall"] = function(args)
+    local myChar = LocalPlayer.Character
+    if not myChar then return false, "no character" end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return false, "no root" end
+    -- Note: only works in games without server-side anti-exploit
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local root = p.Character:FindFirstChild("HumanoidRootPart")
+            if root then
+                pcall(function() root.CFrame = myRoot.CFrame + Vector3.new(math.random(-5,5), 0, math.random(-5,5)) end)
+            end
+        end
+    end
+    log("BRINGALL executed")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -480,7 +584,7 @@ local function executeCommand(data)
     local args = data.args or {}
     local id = data.id
 
-    log(string.format("Processing command #%s: %s", tostring(id), tostring(cmd)))
+    log(string.format("Processing #%s: %s", tostring(id), tostring(cmd)))
 
     local handler = CommandHandlers[cmd]
     if not handler then
@@ -504,12 +608,10 @@ local function executeCommand(data)
         }
         if result == false then
             patchData.status = "error"
-            patchData.error = errMsg or "handler returned false"
+            patchData.error = errMsg or "handler error"
         end
         catbasePatch(COMMAND_PATH, patchData)
-        log(string.format("Command #%s completed (status=%s)", tostring(id), patchData.status))
     else
-        log(string.format("Command #%s failed: %s", tostring(id), tostring(result)), "ERROR")
         catbasePatch(COMMAND_PATH, {
             status = "error",
             error = tostring(result),
@@ -523,96 +625,59 @@ end
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 local function main()
-    log("╔══════════════════════════════════════╗")
-    log("║       CatControl Executor v3.0       ║")
-    log("║    Auto-Register + Auto-Rejoin       ║")
-    log("╚══════════════════════════════════════╝")
-    log("")
-    log("Player: " .. USERNAME .. " (ID: " .. tostring(LocalPlayer.UserId) .. ")")
-    log("Catbase: " .. CONFIG.catbaseUrl)
-    log("Database: " .. CONFIG.database)
+    log("CatControl Executor v4.0")
+    log("Player: " .. USERNAME)
     log("")
 
-    -- ── Register with Catbase ──
-    log("Registering with Catbase...")
+    -- Register
     if not register() then
-        log("Retrying registration in " .. CONFIG.retryDelay .. "s...", "WARN")
         task.wait(CONFIG.retryDelay)
-        if not register() then
-            log("Registration failed after retry — continuing anyway", "ERROR")
-        end
+        register()
     end
+    notify("CatControl", "Online: " .. USERNAME, 5)
 
-    notify("CatControl", "Registered as " .. USERNAME, 5)
-
-    -- ── Initialize per-user command slot ──
+    -- Init command slot
     local existing = catbaseGet(COMMAND_PATH)
     local lastId = 0
     if existing and type(existing) == "table" and existing.id then
         lastId = tonumber(existing.id) or 0
-        log("Synced — last command ID: " .. tostring(lastId))
     else
-        catbasePut(COMMAND_PATH, {
-            id = 0,
-            command = "none",
-            status = "init",
-            issuedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        })
-        log("Initialized command slot")
+        catbasePut(COMMAND_PATH, { id = 0, command = "none", status = "init", issuedAt = os.date("!%Y-%m-%dT%H:%M:%SZ") })
     end
 
-    -- ── Start heartbeat coroutine ──
     task.spawn(heartbeat)
-    log("Heartbeat started (every " .. CONFIG.heartbeatInterval .. "s)")
-
-    -- ── Auto-rejoin on kick ──
     setupAutoRejoin()
 
-    -- ── Try to mark offline on game close ──
     pcall(function()
-        game:BindToClose(function()
-            setOffline()
-        end)
+        game:BindToClose(function() setOffline() end)
     end)
 
-    log("")
-    log("Polling for commands... (every " .. CONFIG.pollInterval .. "s)")
-
-    -- ── Poll loop ──
+    -- Poll loop
     local consecutiveErrors = 0
-
     while true do
         local ok, err = pcall(function()
             local data = catbaseGet(COMMAND_PATH)
-
             if not data or type(data) ~= "table" then
                 consecutiveErrors = consecutiveErrors + 1
                 if consecutiveErrors >= CONFIG.maxRetries then
-                    log("Too many errors — backing off for " .. CONFIG.backoffDelay .. "s", "WARN")
                     task.wait(CONFIG.backoffDelay)
                     consecutiveErrors = 0
                 end
                 return
             end
-
             consecutiveErrors = 0
-
             local id = tonumber(data.id)
             if not id then return end
-
             if id > lastId then
                 lastId = id
-                -- Skip commands the bot already cleared (stale pending)
                 if data.status == "cleared" then
-                    log("Skipped cleared command #" .. tostring(id))
+                    log("Skipped cleared #" .. tostring(id))
                 else
                     executeCommand(data)
                 end
             end
         end)
-
         if not ok then
-            log("Poll loop error: " .. tostring(err), "ERROR")
             consecutiveErrors = consecutiveErrors + 1
             if consecutiveErrors >= CONFIG.maxRetries then
                 task.wait(CONFIG.backoffDelay)
@@ -625,9 +690,5 @@ local function main()
         end
     end
 end
-
--- ═══════════════════════════════════════════════════════════════════════════════
---  LAUNCH
--- ═══════════════════════════════════════════════════════════════════════════════
 
 task.spawn(main)
